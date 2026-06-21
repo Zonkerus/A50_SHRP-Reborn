@@ -1,0 +1,143 @@
+name: Build SHRP Recovery for A50
+
+on:
+  workflow_dispatch:
+    inputs:
+      ccache_behavior:
+        description: 'ccache behavior'
+        required: true
+        default: 'disabled'
+        type: choice
+        options:
+          - 'disabled'
+          - 'success_only'
+          - 'always'
+
+jobs:
+  build:
+    name: Build Recovery
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@v10
+
+      - name: Install dependencies
+        run: |
+          set -eo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq gcc-11 g++-11
+
+          sudo update-alternatives --install /usr/bin/gcc  gcc  /usr/bin/gcc-11 100
+          sudo update-alternatives --install /usr/bin/g++  g++  /usr/bin/g++-11 100
+          sudo update-alternatives --install /usr/bin/cc   cc   /usr/bin/gcc-11 100
+          sudo update-alternatives --install /usr/bin/c++  c++  /usr/bin/g++-11 100
+
+          echo "gcc:  $(gcc --version | head -1)"
+          echo "g++:  $(g++ --version | head -1)"
+
+      - name: Install Python 2
+        run: |
+          wget -q https://github.com/Zonkerus/Clang_13.0.1/raw/master/python2.7_2.7.18-1_amd64.deb
+          sudo dpkg -i python2.7_2.7.18-1_amd64.deb
+
+          echo "python2.7: $(python2.7 --version 2>&1)"
+          echo "python:    $(python --version 2>&1)"
+
+      - name: Install ccache
+        if: inputs.ccache_behavior != 'disabled'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CCACHE_TAG=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/ccache/ccache/releases/latest | jq -r .tag_name)
+          CCACHE_VERSION="${CCACHE_TAG#v}"
+
+          echo "Installing ccache version: $CCACHE_VERSION"
+
+          wget -q "https://github.com/ccache/ccache/releases/download/${CCACHE_TAG}/ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.xz"
+
+          tar -xf "ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.xz"
+          sudo cp "ccache-${CCACHE_VERSION}-linux-x86_64-glibc/ccache" /usr/local/bin/ccache
+
+          ccache --version
+          rm -rf "ccache-${CCACHE_VERSION}-linux-x86_64-glibc"*
+
+      - name: Install and Configure Repo Tool
+        run: |
+          mkdir -p ~/.local/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.local/bin/repo
+          chmod a+x ~/.local/bin/repo
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Initialize Repo
+        run: |
+          mkdir -p workspace
+          cd workspace
+          repo init --depth=1 -u https://github.com/SHRP-Reborn/manifest.git -b shrp-12.1
+
+      - name: Sync Sources
+        run: |
+          cd workspace
+          repo sync -c -j8 --force-sync --no-clone-bundle --no-tags
+
+      - name: Clone Device Tree
+        run: |
+          cd workspace
+          git clone https://github.com/Zonkerus/A50_SHRP-Reborn -b twrp-12.1 device/samsung/a50
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v5
+        if: inputs.ccache_behavior != 'disabled'
+        with:
+          path: .ccache
+          key: ccache-shrp-a50-${{ github.run_id }}
+          restore-keys: |
+            ccache-shrp-a50-
+
+      - name: Build Recovery
+        run: |
+          cd workspace
+          source build/envsetup.sh
+          lunch twrp_a50-eng
+
+          CCACHE_FLAG=""
+          if [ "${{ inputs.ccache_behavior }}" != "disabled" ]; then
+            CCACHE_DIR="$(cd .. && pwd)/.ccache"
+            mkdir -p "$CCACHE_DIR"
+            export USE_CCACHE=1
+            export CCACHE_EXEC=/usr/local/bin/ccache
+            export CCACHE_DIR
+            export CCACHE_COMPRESS=1
+            ccache -M 5G
+            echo "  I: ccache is enabled for this build."
+          fi
+
+          mka recoveryimage 2>&1 | grep -vE "nsjail|SEPOLICY_DIR|commands commence"
+
+      - name: Upload Recovery Image
+        uses: actions/upload-artifact@v7
+        with:
+          name: A50_SHRP_Recovery
+          path: workspace/out/target/product/a50/recovery.img
+
+      - name: Save ccache (Success only)
+        uses: actions/cache/save@v5
+        if: success() && inputs.ccache_behavior == 'success_only'
+        with:
+          path: .ccache
+          key: ccache-shrp-a50-${{ github.run_id }}
+
+      - name: Save ccache (Always)
+        uses: actions/cache/save@v5
+        if: always() && inputs.ccache_behavior == 'always'
+        with:
+          path: .ccache
+          key: ccache-shrp-a50-${{ github.run_id }}
